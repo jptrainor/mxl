@@ -190,46 +190,107 @@ across the C entry points.
   - Status: open
 
 - [ ] **BUG-3: `mxlFlowWriterCommitGrain` can move `headIndex` backwards.** _(was BUG-1)_
-  - Every commit sets `headIndex = _currentIndex` ([DW] L167). A partial commit doesn't update
-    `_lastCommittedIndex`, so after cancelling a partly committed grain the writer can open and commit a lower
-    index, and readers see the head go backwards.
-  - The header says the head moves only "IF this grain is the new head".
-  - Test evidence: "Video Flow : Slices" ([TF] L612-L618) asserts `headIndex == index` after each partial
+  - **Finding:**
+    - Every commit sets `headIndex = _currentIndex` ([DW] L167). A partial commit doesn't update
+      `_lastCommittedIndex`, so after cancelling a partly committed grain the writer can open and commit a
+      lower index, and readers see the head go backwards.
+    - The header says the head moves only "IF this grain is the new head".
+  - **Test evidence:** "Video Flow : Slices" ([TF] L612-L618) asserts `headIndex == index` after each partial
     commit, so moving the head on a partial commit is intended. No test covers cancelling and then committing
     a lower index, and nothing suggests the head is meant to move backwards. Stays BUG.
+  - **Failure scenario:**
+    1. The writer completes grain N. `_lastCommittedIndex` and `headIndex` are both N.
+    2. The writer opens grain N+5 and commits some slices. `headIndex` becomes N+5, and readers can see the
+       partial grain.
+    3. The writer cancels N+5. `_lastCommittedIndex` is still N.
+    4. The writer opens grain N+2. This is allowed because N+2 > N. Grain N+1 is marked invalid as a skipped
+       grain.
+    5. The writer completes N+2. `headIndex` is set to N+2, which is lower than N+5.
+    - A reader that has seen `headIndex == N+5` now sees it move back to N+2. Indexes it was told about are
+      now ahead of the head, and grain N+5's slot still holds the partial data from step 2.
+  - **Suggested regression test:** run the scenario above with a reader that records `headIndex` after each
+    commit. Assert that `headIndex` never decreases: either opening N+2 in step 4 is rejected, or `headIndex`
+    stays at N+5 or higher after step 5.
   - Related: DC-BUG-7 (the sample path already guards against this).
   - Status: open
 
 - [ ] **BUG-4: `mxlFlowWriterCommitGrain` copies the caller's whole `mxlGrainInfo` without checking it.** _(was BUG-2)_
-  - The caller's struct is copied into shared memory as-is ([DW] L170).
-  - Fields that should never change (`totalSlices`, `grainSize`, `version`, `size`) can be overwritten.
-  - `validSlices <= totalSlices` isn't checked. If it's larger, the grain never finishes, yet readers using
-    `>=` treat it as available.
-  - The header only promises that `flags` is updated.
-  - Test evidence: every writer test changes the struct returned by open (`validSlices`, `flags`) and passes
-    it back ([TF] L97-L98, L613-L614, L1222-L1223). Passing the struct back is the intended way to commit.
-    No test changes the fields that should be fixed or sets `validSlices > totalSlices`. Stays BUG, as
+  - **Finding:**
+    - The caller's struct is copied into shared memory as-is ([DW] L170).
+    - Fields that should never change (`totalSlices`, `grainSize`, `version`, `size`) can be overwritten.
+    - `validSlices <= totalSlices` isn't checked. If it's larger, the grain never finishes, yet readers using
+      `>=` treat it as available.
+    - The header only promises that `flags` is updated.
+  - **Test evidence:** every writer test changes the struct returned by open (`validSlices`, `flags`) and
+    passes it back ([TF] L97-L98, L613-L614, L1222-L1223). Passing the struct back is the intended way to
+    commit. No test changes the fields that should be fixed or sets `validSlices > totalSlices`. Stays BUG, as
     missing validation.
+  - **Failure scenario:**
+    - **`validSlices` too large:** a writer with an off-by-one error commits `validSlices = totalSlices + 1`.
+      - The writer's `==` check fails, so the grain is never finished and `_lastCommittedIndex` doesn't
+        advance.
+      - Readers' `>=` check passes, so they return the grain as complete.
+      - The writer and readers now disagree about the grain's state. The writer can keep committing to a
+        grain that readers have already consumed.
+    - **Fixed fields changed:** a writer reuses an `mxlGrainInfo` from another flow or clears it by mistake,
+      and commits it with a different `totalSlices`, e.g. 1.
+      - The writer treats the grain as complete after 1 slice.
+      - Readers see `totalSlices == 1`, so a full-grain read returns `MXL_STATUS_OK` for a frame with 1 valid
+        line.
+      - The wrong `totalSlices` stays in that slot's header until the slot is reused.
+  - **Suggested regression test:**
+    - Commit `validSlices = totalSlices + 1`. Expect `MXL_ERR_INVALID_ARG`.
+    - Commit with a changed `totalSlices`, `grainSize`, `version` or `size`. Expect `MXL_ERR_INVALID_ARG`, or
+      check with `mxlFlowWriterGetGrainInfo` and a reader that the stored fields are unchanged.
   - Status: open
 
 - [ ] **BUG-5: An invalid-flagged commit doesn't finish the grain.** _(was BUG-3)_
-  - This contradicts the `MXL_GRAIN_FLAG_INVALID` documentation, which describes the flag as the proper way
-    to move the ring buffer forward ([DW] L173-L178).
-  - Test evidence: "Video Flow : Create/Destroy" ([TF] L96-L118) and "Data Flow : Create/Destroy"
+  - **Finding:** this contradicts the `MXL_GRAIN_FLAG_INVALID` documentation, which describes the flag as the
+    proper way to move the ring buffer forward ([DW] L173-L178).
+  - **Test evidence:** "Video Flow : Create/Destroy" ([TF] L96-L118) and "Data Flow : Create/Destroy"
     ([TF] L469-L490) commit an invalid-flagged grain with `validSlices == 0`. The reader gets
     `MXL_STATUS_OK` with the flag set, and `headIndex` moves to that index. The tests treat the grain as
     finished, which supports the fix in #728.
+  - **Failure scenario:**
+    1. An input times out, so the writer commits grain N with `MXL_GRAIN_FLAG_INVALID`, as the docs describe.
+       Readers treat N as finished.
+    2. The writer still treats N as open. `_lastCommittedIndex` is still N−1.
+    3. Reopening N succeeds, so late data can be written into a grain that readers have already handled as
+       invalid.
+    4. Opening N+1 makes the writer treat N as a skipped grain. It rewrites N's header (`validSlices = 0`,
+       flag set again), changing shared memory for a grain that has already been committed.
+  - **Suggested regression test:**
+    - The "Video Flow : Grain writer state" test in #728: after an invalid commit, reopening the same index
+      returns `MXL_ERR_INVALID_ARG`, and opening the next index succeeds.
+    - Add: after committing N as invalid, open N+1. Use `mxlFlowWriterGetGrainInfo` or a reader to check that
+      N's header is unchanged.
   - Status: issue filed `dmf-mxl/mxl#719` · PR open `dmf-mxl/mxl#728`
 
 - [ ] **BUG-6: `mxlFlowWriterGetGrainInfo` can return a different grain's info.** _(was BUG-4)_
-  - It reads slot `index % grainCount` and doesn't check that the stored index matches the requested one
-    ([DW] L77-L82).
-  - Test evidence: none found in the tests reviewed. No test calls `mxlFlowWriterGetGrainInfo`.
+  - **Finding:** it reads slot `index % grainCount` and doesn't check that the stored index matches the
+    requested one ([DW] L77-L82).
+  - **Test evidence:** none found in the tests reviewed. No test calls `mxlFlowWriterGetGrainInfo`.
+  - **Failure scenario:**
+    1. The writer completes grain N.
+    2. It calls `mxlFlowWriterGetGrainInfo(N + grainCount)` to check whether that grain has been written
+       yet.
+    3. That index maps to the same slot as N, so the call returns `MXL_STATUS_OK` with grain N's info:
+       `index == N`, all slices valid.
+    4. A caller that doesn't check `info.index` concludes that grain N + `grainCount` is already complete.
+  - **Suggested regression test:** complete grain N, then call
+    `mxlFlowWriterGetGrainInfo(N + grainCount)`. Expect an error, e.g. `MXL_ERR_OUT_OF_RANGE_TOO_EARLY`, not
+    `MXL_STATUS_OK` with `info.index == N`. Also check that `mxlFlowWriterGetGrainInfo(N)` still returns
+    grain N.
   - Status: open
 
 - [ ] **BUG-7: `mxlCreateFlowSynchronizationGroup` writes through `group` without a null check.** _(was BUG-5)_
-  - [FLOW] L666. Every other output pointer in the API is checked.
-  - Test evidence: "Synchronization group : Repeated waits" ([TSG] L69-L70) only passes a valid pointer.
+  - **Finding:** [FLOW] L666. Every other output pointer in the API is checked.
+  - **Test evidence:** "Synchronization group : Repeated waits" ([TSG] L69-L70) only passes a valid pointer.
+  - **Failure scenario:** a caller passes `NULL` for `group`, for example from a binding that forwards an
+    optional output. The library writes through the null pointer and the process crashes. Every other
+    function returns `MXL_ERR_INVALID_ARG` for this mistake.
+  - **Suggested regression test:** `mxlCreateFlowSynchronizationGroup(instance, nullptr)` returns
+    `MXL_ERR_INVALID_ARG`. Before the fix this test crashes, so run it as a death test or in a subprocess.
   - Status: open
 
 ---
@@ -410,86 +471,188 @@ across the C entry points.
 ### Discrete/Continuous Consistency: Looks like a real bug (most egregious first)
 
 - [ ] **DC-BUG-1: `mxlReleaseFlowWriter` can let an exception escape the C API.** (B1)
-  - It only catches `std::exception` ([FLOW] L273-L281). Any other exception thrown during release goes
-    through an `extern "C"` function and calls `std::terminate`.
-  - Every other entry point has a `catch (...)`.
-  - Test evidence: none found in the tests reviewed.
+  - **Finding:**
+    - It only catches `std::exception` ([FLOW] L273-L281). Any other exception thrown during release goes
+      through an `extern "C"` function and calls `std::terminate`.
+    - Every other entry point has a `catch (...)`.
+  - **Test evidence:** none found in the tests reviewed.
+  - **Failure scenario:**
+    1. During release, the last-writer path calls `isExclusive()`/`makeExclusive()` and may delete the flow
+       ([INST] L176-L184). Something in that path throws an exception not derived from `std::exception`,
+       for example from a third-party library or a platform-specific unwind.
+    2. The exception reaches the `extern "C"` boundary uncaught, and `std::terminate` aborts the whole host
+       process.
+    - The same failure in any other entry point would return `MXL_ERR_UNKNOWN`.
+  - **Suggested regression test:**
+    - Needs fault injection, because this can't be triggered through the public API with real flows.
+    - Use an internal test with a test `FlowIoFactory` whose writer throws a non-`std::exception` value from
+      `makeExclusive()`.
+    - Call `mxlReleaseFlowWriter` and expect `MXL_ERR_UNKNOWN` instead of process termination.
   - Status: open
 
 - [ ] **DC-BUG-2: `mxlCreateInstance` doesn't check `in_mxlDomain` for null.** (B2)
-  - The pointer is used directly as a path ([MXL] L45-L52). Building a `std::filesystem::path` or
-    `std::string` from a null `char const*` is undefined behaviour.
-  - The surrounding `try` can't catch undefined behaviour, so the documented "returns NULL" isn't guaranteed.
-  - Test evidence: none found in the tests reviewed. Null arguments are tested for `mxlIsTmpFs` ([TI] L25-L34)
-    and `mxlGetFlowDef` ([TF] L980-L990), but not for `mxlCreateInstance`.
+  - **Finding:**
+    - The pointer is used directly as a path ([MXL] L45-L52). Building a `std::filesystem::path` or
+      `std::string` from a null `char const*` is undefined behaviour.
+    - The surrounding `try` can't catch undefined behaviour, so the documented "returns NULL" isn't
+      guaranteed.
+  - **Test evidence:** none found in the tests reviewed. Null arguments are tested for `mxlIsTmpFs`
+    ([TI] L25-L34) and `mxlGetFlowDef` ([TF] L980-L990), but not for `mxlCreateInstance`.
+  - **Failure scenario:** an application builds the domain path from an environment variable or config file
+    and passes `NULL` when the setting is missing. It expects to get `NULL` back and report a configuration
+    error. Instead, the library hits undefined behaviour, typically a crash inside the path or string
+    constructor.
+  - **Suggested regression test:** `mxlCreateInstance(nullptr, nullptr)` returns `nullptr`. Before the fix
+    this test may crash the test process, so run it as a death test or in a subprocess.
   - Status: open
 
 - [ ] **DC-BUG-3: The list of sync groups isn't thread-safe.** (B3)
-  - `createFlowSynchronizationGroup` and `releaseFlowSynchronizationGroup` change `_syncGroups` without taking
-    `_mutex` ([INST] L439-L456).
-  - `releaseReader` walks the same list while holding the lock ([INST] L151-L160).
-  - Doing both at once on different threads is a data race on a `std::forward_list`.
-  - Test evidence: none found in the tests reviewed. The sync-group test is single-threaded for group
+  - **Finding:**
+    - `createFlowSynchronizationGroup` and `releaseFlowSynchronizationGroup` change `_syncGroups` without
+      taking `_mutex` ([INST] L439-L456).
+    - `releaseReader` walks the same list while holding the lock ([INST] L151-L160).
+    - Doing both at once on different threads is a data race on a `std::forward_list`.
+  - **Test evidence:** none found in the tests reviewed. The sync-group test is single-threaded for group
     operations ([TSG] L69-L72, L109-L111).
+  - **Failure scenario:** in a multi-threaded application sharing one instance, thread A creates or releases a
+    sync group while thread B releases a reader. Both threads use the `_syncGroups` list at the same time. The
+    list can be corrupted, giving crashes or a group that is never cleaned up. The failure is intermittent and
+    timing-dependent.
+  - **Suggested regression test:**
+    - A stress test with two threads on one instance: one repeatedly creates and releases sync groups, the
+      other repeatedly creates and releases readers.
+    - Run it under ThreadSanitizer, which reports the race even when no crash happens. Without TSan the test
+      may pass by luck.
   - Status: open
 
 - [ ] **DC-BUG-4: Permission checks differ between the grain and sample paths.** (A7)
-  - The continuous writer and reader call `checkPermissions()` and throw if it fails ([CW] L26-L29,
-    [CR] L19-L22).
-  - The discrete writer and reader don't ([DW] L21-L30, [DR] L40-L51).
-  - The same permission problem therefore fails at creation for one flow type and not at all for the other.
-  - Test evidence: "mxlCreateFlow: unwritable domain" ([TF] L1008-L1027) tests a discrete (v210) writer
+  - **Finding:**
+    - The continuous writer and reader call `checkPermissions()` and throw if it fails ([CW] L26-L29,
+      [CR] L19-L22).
+    - The discrete writer and reader don't ([DW] L21-L30, [DR] L40-L51).
+    - The same permission problem therefore fails at creation for one flow type and not at all for the
+      other.
+  - **Test evidence:** "mxlCreateFlow: unwritable domain" ([TF] L1008-L1027) tests a discrete (v210) writer
     only. That failure comes from flow creation, not from `checkPermissions()`. No continuous or reader
     permission test exists.
+  - **Failure scenario:**
+    1. A deployment sets file permissions that fail `checkPermissions()` for both an audio flow and a video
+       flow.
+    2. Creating a reader or writer for the audio flow fails immediately.
+    3. Creating one for the video flow succeeds. The problem appears later, as read or write errors, or not
+       at all.
+    - Operators see different behaviour for the same misconfiguration depending on the flow type.
+  - **Suggested regression test:**
+    - Create a v210 flow and an audio flow, apply the same permission setup to both, and create a reader and
+      a writer for each. Assert that both flow types give the same result.
+    - The exact setup depends on what `checkPermissions()` checks; that function was not reviewed.
+    - The test must not run as root, which bypasses permission checks.
   - Status: open
 
 - [ ] **DC-BUG-5: The reader reports permission errors as `MXL_ERR_UNKNOWN`.** (B5)
-  - `mxlCreateFlowWriter` maps permission-type filesystem errors to `MXL_ERR_PERMISSION_DENIED`
-    ([FLOW] L228-L240).
-  - `mxlCreateFlowReader` maps only `ENOENT`; anything else becomes `MXL_ERR_UNKNOWN` ([FLOW] L154-L167).
-  - The continuous reader's `checkPermissions()` failure is a `std::runtime_error`, which also becomes
-    `MXL_ERR_UNKNOWN`.
-  - Test evidence: "mxlCreateFlow: unwritable domain" ([TF] L1022) asserts `MXL_ERR_PERMISSION_DENIED` for
+  - **Finding:**
+    - `mxlCreateFlowWriter` maps permission-type filesystem errors to `MXL_ERR_PERMISSION_DENIED`
+      ([FLOW] L228-L240).
+    - `mxlCreateFlowReader` maps only `ENOENT`; anything else becomes `MXL_ERR_UNKNOWN` ([FLOW] L154-L167).
+    - The continuous reader's `checkPermissions()` failure is a `std::runtime_error`, which also becomes
+      `MXL_ERR_UNKNOWN`.
+  - **Test evidence:** "mxlCreateFlow: unwritable domain" ([TF] L1022) asserts `MXL_ERR_PERMISSION_DENIED` for
     the writer. Reporting permission errors as their own code is intended; the reader has no equivalent test.
     Strengthened.
+  - **Failure scenario:** a consumer process runs as a user that can't read a flow's files. The writer side of
+    the same setup would report `MXL_ERR_PERMISSION_DENIED`. `mxlCreateFlowReader` returns `MXL_ERR_UNKNOWN`,
+    so the application can't tell the user it's a permissions problem. `mxl.h` also tells callers not to
+    check for `MXL_ERR_UNKNOWN`.
+  - **Suggested regression test:** create a flow, remove read permission from its files, and call
+    `mxlCreateFlowReader`. Expect `MXL_ERR_PERMISSION_DENIED`. Do this for a grain flow and a sample flow. Must
+    not run as root.
   - Status: open
 
 - [ ] **DC-BUG-6: The sample path never updates `lastReadTime`.** (A9)
-  - The discrete reader touches the flow's access file on each successful read ([DR] L117-L121, L143-L147).
-  - The continuous reader never opens or touches that file.
-  - Reader activity on audio flows is therefore never reflected in their runtime info.
-  - Test evidence: the discrete tests assert that `lastReadTime` increases after a read ([TF] L120-L121,
+  - **Finding:**
+    - The discrete reader touches the flow's access file on each successful read ([DR] L117-L121,
+      L143-L147).
+    - The continuous reader never opens or touches that file.
+    - Reader activity on audio flows is therefore never reflected in their runtime info.
+  - **Test evidence:** the discrete tests assert that `lastReadTime` increases after a read ([TF] L120-L121,
     L492-L493, L634-L636). "Audio Flow : Create/Destroy" checks `headIndex` after a read but not
     `lastReadTime` ([TF] L730-L735). The field is clearly intended to work; the audio gap is untested.
     Strengthened.
+  - **Failure scenario:** a monitoring tool, such as `mxl-info`, or a controller uses `lastReadTime` to decide
+    whether a flow has active consumers. Audio flows with readers that read continuously still show their
+    original `lastReadTime`. The tool reports them as unused, and a controller might stop or reroute them.
+  - **Suggested regression test:** copy the discrete check for an audio flow. Record `lastReadTime`, read
+    samples with `mxlFlowReaderGetSamples`, wait briefly for the update to propagate (as the discrete tests do
+    at [TF] L103-L104), and assert that `lastReadTime` has increased.
   - Status: open
 
 - [ ] **DC-BUG-7: The grain path lets `headIndex` move backwards; the sample path doesn't.** (A1)
-  - This is the same issue as BUG-3, seen by comparing the two paths.
-  - `openSamples` rejects `index <= _lastCommittedIndex` and any overlap with committed data ([CW] L90-L96).
-    The grain path has no equivalent check against the current `headIndex`.
-  - Test evidence: see BUG-3.
+  - **Finding:**
+    - This is the same issue as BUG-3, seen by comparing the two paths.
+    - `openSamples` rejects `index <= _lastCommittedIndex` and any overlap with committed data
+      ([CW] L90-L96). The grain path has no equivalent check against the current `headIndex`.
+  - **Test evidence:** see BUG-3.
+  - **Failure scenario:**
+    - Grain path: as in BUG-3. A partial commit moves `headIndex` to N+5, then cancel, open N+2 and commit
+      move it back to N+2.
+    - Sample path, for comparison: commit samples ending at M, open a range ending at M+K, cancel, then open
+      and commit a range ending at M+J where J < K.
+      - `headIndex` goes from M to M+J and never decreases.
+      - The cancelled range never moved the head, because sample commits are never partial.
+  - **Suggested regression test:** use the BUG-3 test for the grain path. Add the sample-path sequence above,
+    asserting that `headIndex` never decreases. That assertion already passes for samples, and should pass for
+    grains once BUG-3 is fixed.
   - Fix together with BUG-3.
   - Status: open
 
 - [ ] **DC-BUG-8: `mxlIsFlowActive` reports any open failure as "flow not found".** (B6)
-  - Every `open()` failure, including `EACCES`, returns `MXL_ERR_FLOW_NOT_FOUND` ([FLOW] L47-L58).
-  - The code special-cases `ENOENT` and then returns the same code for everything else.
-  - Test evidence: only the active case is tested ([TF] L55-L57, L272-L275).
+  - **Finding:**
+    - Every `open()` failure, including `EACCES`, returns `MXL_ERR_FLOW_NOT_FOUND` ([FLOW] L47-L58).
+    - The code special-cases `ENOENT` and then returns the same code for everything else.
+  - **Test evidence:** only the active case is tested ([TF] L55-L57, L272-L275).
+  - **Failure scenario:** a monitoring process without read permission on a flow's data file calls
+    `mxlIsFlowActive`. It gets `MXL_ERR_FLOW_NOT_FOUND` for a flow that exists and is being written. It
+    reports the flow as missing, or a controller tries to recreate it, instead of reporting a permissions
+    problem.
+  - **Suggested regression test:** create a flow, remove read permission from its data file, and call
+    `mxlIsFlowActive`. Expect `MXL_ERR_PERMISSION_DENIED`, or at least not `MXL_ERR_FLOW_NOT_FOUND`. Keep the
+    existing check that a deleted flow returns `MXL_ERR_FLOW_NOT_FOUND`. Must not run as root.
   - Status: open
 
 - [ ] **DC-BUG-9: Grain commit with no flow data leaves the writer's state set.** (A6)
-  - The discrete writer returns `MXL_ERR_UNKNOWN` and leaves `_currentIndex` set ([DW] L157-L187).
-  - The continuous writer clears it first ([CW] L178-L182).
-  - Minor: the writer is unusable at that point anyway.
-  - Test evidence: none found in the tests reviewed.
+  - **Finding:**
+    - The discrete writer returns `MXL_ERR_UNKNOWN` and leaves `_currentIndex` set ([DW] L157-L187).
+    - The continuous writer clears it first ([CW] L178-L182).
+    - Minor: the writer is unusable at that point anyway.
+  - **Test evidence:** none found in the tests reviewed.
+  - **Failure scenario:** if a discrete writer ever loses its flow data, a commit returns `MXL_ERR_UNKNOWN`
+    but the writer still records the grain as open. Any later call then behaves differently from a
+    continuous writer in the same state, which has already cleared the open range.
+  - **Suggested regression test:**
+    - A writer with no flow data can't be created through the public C API. The discrete writer's
+      constructor and destructor also use the flow data, so this needs an internal test hook.
+    - With the hook, set up both writer types without flow data, call commit, and assert that both return
+      `MXL_ERR_UNKNOWN` and leave no range or grain open.
   - Status: open
 
 - [ ] **DC-BUG-10: `isExclusive()` and `makeExclusive()` behave differently when there's no flow data.** (A8)
-  - The discrete writer returns `false` ([DW] L137-L155); the continuous writer throws ([CW] L220-L238).
-  - `~Instance` catches the exception, but `Instance::releaseWriter` doesn't ([INST] L101-L116, L167-L189).
-  - Minor: the case shouldn't happen in practice.
-  - Test evidence: none found in the tests reviewed.
+  - **Finding:**
+    - The discrete writer returns `false` ([DW] L137-L155); the continuous writer throws ([CW] L220-L238).
+    - `~Instance` catches the exception, but `Instance::releaseWriter` doesn't ([INST] L101-L116,
+      L167-L189).
+    - Minor: the case shouldn't happen in practice.
+  - **Test evidence:** none found in the tests reviewed.
+  - **Failure scenario:** releasing the last writer with no flow data has different results by flow type:
+    - **Discrete writer:** `releaseWriter` sees `false`, doesn't delete the flow, and removes the writer from
+      the instance.
+    - **Continuous writer:** the exception escapes `releaseWriter` before the writer is removed.
+      `mxlReleaseFlowWriter` returns `MXL_ERR_UNKNOWN`, and the writer stays in the instance's table.
+  - **Suggested regression test:**
+    - As with DC-BUG-9, this needs an internal test hook, because the state can't be reached through the
+      public API.
+    - With the hook, call `isExclusive()` and `makeExclusive()` on both writer types without flow data.
+      Assert that they behave the same way: both return `false`, or both throw.
+    - Then release each through `Instance::releaseWriter` and assert that the outcome is the same for both.
   - Status: open
 
 ### Discrete/Continuous Consistency: Documentation needs updating (most out of date first)
