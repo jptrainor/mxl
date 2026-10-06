@@ -38,13 +38,13 @@ across the C entry points.
 
 | Section | Items |
 |---|---|
-| BUG | 5 |
+| BUG | 7 |
 | DOC | 14 |
 | INT | 3 |
 | DC-BUG | 10 |
 | DC-DOC | 3 |
 | DC-INT | 7 |
-| **Total** | **42** |
+| **Total** | **44** |
 
 ## Changes from the test review
 
@@ -59,6 +59,18 @@ across the C entry points.
 | `MXL_ERR_UNKNOWN` for invalid input | DC-INT-5 | DC-INT-1 | Ranked first: tests assert the exact code that `mxl.h` says not to check for |
 | Other DOC, DC-INT items | — | renumbered | To fill the gaps left by the moves |
 
+## Changes from external review
+
+| Item | Before | After | Reason |
+|---|---|---|---|
+| Sync group returns OK for incomplete grains | — | BUG-1 (new) | Found in an external review; verified against the code. Breaks the documented promise of the sync-group API in normal use |
+| Sync group returns OK for overwritten data | — | BUG-2 (new) | Found in an external review; verified against the code. Bypasses the reader's too-late check |
+| `mxlFlowWriterCommitGrain` can move `headIndex` backwards | BUG-1 | BUG-3 | Renumbered |
+| `mxlFlowWriterCommitGrain` copies `mxlGrainInfo` unchecked | BUG-2 | BUG-4 | Renumbered |
+| Invalid-flagged commit doesn't finish the grain | BUG-3 | BUG-5 | Renumbered |
+| `mxlFlowWriterGetGrainInfo` can return another grain's info | BUG-4 | BUG-6 | Renumbered |
+| `mxlCreateFlowSynchronizationGroup` null check | BUG-5 | BUG-7 | Renumbered |
+
 ## Already addressed
 
 - [x] **REF-1: `validSlices` not reset when a new grain is opened.** Fixed.
@@ -69,7 +81,115 @@ across the C entry points.
 
 ## 1. Looks like a real bug (most egregious first)
 
-- [ ] **BUG-1: `mxlFlowWriterCommitGrain` can move `headIndex` backwards.**
+- [ ] **BUG-1: `mxlFlowSynchronizationGroupWaitForDataAt` can return `MXL_STATUS_OK` for a grain that isn't complete.** _(new)_
+  - **What the API promises:**
+    - `mxlFlowSynchronizationGroupAddReader` adds a grain reader so the group waits for the grain "to become
+      fully available" ([FLOWH] L527-L550).
+    - `mxlFlowSynchronizationGroupAddPartialGrainReader` makes the group wait for "at least
+      `minValidSlices`" ([FLOWH] L552-L573).
+    - `mxlFlowSynchronizationGroupWaitForDataAt` returns `MXL_STATUS_OK` only "if the data corresponding to
+      the specified timestamp has become available" ([FLOWH] L589-L604).
+  - **What the code does:**
+    - For each reader, `waitForDataAt` converts the timestamp to an index. It calls the reader's wait method
+      only if that index is greater than the flow's current `headIndex` ([SYNC] L84-L87).
+    - If the index is less than or equal to `headIndex`, the reader is skipped and treated as ready. When
+      every reader is skipped or ready, the function returns `MXL_STATUS_OK` ([SYNC] L131).
+    - The slice requirement is only checked inside `DiscreteFlowReader::waitForGrain` ([SYNC] L91-L94,
+      [DR] L183-L184), so a skipped reader's requirement is never checked.
+  - **Why `headIndex` doesn't mean "complete":**
+    - A grain commit moves `headIndex` to the grain's index on every commit, including partial ones
+      ([DW] L167).
+    - This is intended: "Video Flow : Slices" asserts `headIndex == index` after each partial commit
+      ([TF] L612-L618).
+    - So `headIndex == N` only means "at least one commit to grain N has happened", not "grain N is
+      complete".
+  - **Failure scenario:**
+    1. A writer opens grain N and commits 1 of 1080 slices. `headIndex` becomes N.
+    2. A consumer creates a group, adds a video reader with `mxlFlowSynchronizationGroupAddReader` (full
+       grain required), and calls `WaitForDataAt` with the timestamp of grain N.
+    3. The group sees `expectedIndex == headIndex`, skips the reader, and returns `MXL_STATUS_OK`.
+    4. The consumer reads grain N and gets a frame with only 1 valid line.
+    - The same happens with `AddPartialGrainReader` whenever the committed slice count is below
+      `minValidSlices`.
+  - **Why it matters:**
+    - The sync group exists so a consumer can wait for video, audio and data for the same timestamp to be
+      ready before processing them together.
+    - This bug makes the group return early in exactly the case it is meant to handle: a writer that commits
+      in slices (`maxCommitBatchSizeHint` < `totalSlices`).
+    - It needs no unusual sequence of calls. It's a race between normal slice-by-slice writing and a normal
+      wait, and it can't be detected from the return code.
+    - Callers that then use `mxlFlowReaderGetGrainNonBlocking` (full grain) would get
+      `MXL_ERR_OUT_OF_RANGE_TOO_EARLY` immediately after the group said the data was ready. Callers that read
+      the payload directly would process half-written frames.
+  - **Why the tests don't catch it:**
+    - "Synchronization group : Repeated waits" ([TSG] L24-L36, L75-L107) only waits for indexes ahead of
+      `headIndex`, and the writer commits complete grains (`validSlices = totalSlices`) in one step.
+    - The reader's wait method is always called in that test, so the skip path is never taken. No test
+      combines partial commits with a sync group.
+  - **Possible fix:**
+    - For discrete readers, always call `waitForGrain(expectedIndex, minValidSlices, deadline)`. It already
+      returns immediately when the grain meets the requirement ([DR] L215-L237), so the fast path saves
+      little.
+    - Alternatively, keep the shortcut but also check the grain's `validSlices`, or its invalid flag, before
+      skipping the reader.
+  - **Suggested regression test:** open a grain, commit fewer slices than `totalSlices`, add a full-grain
+    reader to a group, and call `WaitForDataAt` with a short timeout. Expect a timeout-type error, not
+    `MXL_STATUS_OK`. Repeat with `AddPartialGrainReader` and a `minValidSlices` above the committed count.
+  - Related: BUG-2 (same code path), DOC-4 (sync-group timeout code), DOC-6 (partial commits wake readers).
+  - Status: open
+
+- [ ] **BUG-2: `mxlFlowSynchronizationGroupWaitForDataAt` can return `MXL_STATUS_OK` for data that has already been overwritten.** _(new)_
+  - **What the API promises:** `MXL_STATUS_OK` "if the data corresponding to the specified timestamp has
+    become available" ([FLOWH] L589-L604). Data that has been overwritten in the ring buffer is no longer
+    available.
+  - **What the readers do on their own:**
+    - Both readers reject indexes that are too old with `MXL_ERR_OUT_OF_RANGE_TOO_LATE`.
+    - Discrete reader: the readable window is `headIndex − grainCount + 2` … `headIndex` ([DR] L176-L205).
+      The tail slot is deliberately kept back for the writer, which "Video Flow : tail read during open
+      write" asserts ([TRW] L84-L105).
+    - Continuous reader: the window is the most recent half of the buffer ([CR] L125-L153). "Audio Flow :
+      tail read during open write" asserts this boundary ([TRW] L283-L312).
+  - **What the sync group does:** the skip described in BUG-1 ([SYNC] L86) applies to every index
+    `<= headIndex`, however old. For an index older than the readable window, the reader is never asked,
+    so its too-late check is bypassed and the group returns `MXL_STATUS_OK`.
+  - **Failure scenario:**
+    1. A consumer falls behind, for example because of a processing stall, by more than the flow's history
+       (200 ms by default).
+    2. It calls `WaitForDataAt` with the timestamp it wants next.
+    3. That index is far below `headIndex`, so every reader is skipped and the call returns
+       `MXL_STATUS_OK` immediately.
+    4. The consumer then reads, and either gets `MXL_ERR_OUT_OF_RANGE_TOO_LATE` from the reader or, if it
+       accesses slots directly, gets newer data that has replaced the old.
+  - **Why it matters:**
+    - The group's result is inconsistent with the readers it contains. The group says "ready"; each reader
+      would say "too late".
+    - A consumer that relies on the group to tell it whether to read or to skip ahead can't detect that it
+      has fallen behind, so it can't recover cleanly by jumping to the current index.
+    - It affects both discrete and continuous flows.
+  - **Why ranked below BUG-1:**
+    - It only happens when a consumer is already behind by more than the flow's history, which is a fault
+      condition, whereas BUG-1 happens during normal slice-by-slice writing.
+    - The consumer's next read usually reports too-late, so the error tends to surface one call later
+      rather than being silently wrong.
+    - It's still a bug: the documented contract says "available", and the group's result disagrees with
+      the reader's.
+  - **Note on intent:** the shortcut may have been meant as "data has arrived at some point". If the
+    maintainers want that meaning, the header must say so and the result should not be `MXL_STATUS_OK` for
+    data that can no longer be read. Either way, the code and the header disagree.
+  - **Why the tests don't catch it:** "Synchronization group : Repeated waits" never waits for an index
+    behind `headIndex` ([TSG] L75-L107).
+  - **Possible fix:**
+    - Always call the reader's wait method (`waitForGrain` / `waitForSamples`). Both already return
+      `MXL_ERR_OUT_OF_RANGE_TOO_LATE` for indexes outside the window ([DR] L202-L205, [CR] L153).
+    - If the shortcut is kept for performance, also check that the index is still inside the reader's
+      readable window before skipping.
+  - **Suggested regression test:** fill a flow beyond its history, then call `WaitForDataAt` with a timestamp
+    older than the readable window. Expect `MXL_ERR_OUT_OF_RANGE_TOO_LATE`. Do this for a grain flow and a
+    sample flow.
+  - Related: BUG-1 (same code path).
+  - Status: open
+
+- [ ] **BUG-3: `mxlFlowWriterCommitGrain` can move `headIndex` backwards.** _(was BUG-1)_
   - Every commit sets `headIndex = _currentIndex` ([DW] L167). A partial commit doesn't update
     `_lastCommittedIndex`, so after cancelling a partly committed grain the writer can open and commit a lower
     index, and readers see the head go backwards.
@@ -80,7 +200,7 @@ across the C entry points.
   - Related: DC-BUG-7 (the sample path already guards against this).
   - Status: open
 
-- [ ] **BUG-2: `mxlFlowWriterCommitGrain` copies the caller's whole `mxlGrainInfo` without checking it.**
+- [ ] **BUG-4: `mxlFlowWriterCommitGrain` copies the caller's whole `mxlGrainInfo` without checking it.** _(was BUG-2)_
   - The caller's struct is copied into shared memory as-is ([DW] L170).
   - Fields that should never change (`totalSlices`, `grainSize`, `version`, `size`) can be overwritten.
   - `validSlices <= totalSlices` isn't checked. If it's larger, the grain never finishes, yet readers using
@@ -92,7 +212,7 @@ across the C entry points.
     missing validation.
   - Status: open
 
-- [ ] **BUG-3: An invalid-flagged commit doesn't finish the grain.**
+- [ ] **BUG-5: An invalid-flagged commit doesn't finish the grain.** _(was BUG-3)_
   - This contradicts the `MXL_GRAIN_FLAG_INVALID` documentation, which describes the flag as the proper way
     to move the ring buffer forward ([DW] L173-L178).
   - Test evidence: "Video Flow : Create/Destroy" ([TF] L96-L118) and "Data Flow : Create/Destroy"
@@ -101,13 +221,13 @@ across the C entry points.
     finished, which supports the fix in #728.
   - Status: issue filed `dmf-mxl/mxl#719` · PR open `dmf-mxl/mxl#728`
 
-- [ ] **BUG-4: `mxlFlowWriterGetGrainInfo` can return a different grain's info.**
+- [ ] **BUG-6: `mxlFlowWriterGetGrainInfo` can return a different grain's info.** _(was BUG-4)_
   - It reads slot `index % grainCount` and doesn't check that the stored index matches the requested one
     ([DW] L77-L82).
   - Test evidence: none found in the tests reviewed. No test calls `mxlFlowWriterGetGrainInfo`.
   - Status: open
 
-- [ ] **BUG-5: `mxlCreateFlowSynchronizationGroup` writes through `group` without a null check.**
+- [ ] **BUG-7: `mxlCreateFlowSynchronizationGroup` writes through `group` without a null check.** _(was BUG-5)_
   - [FLOW] L666. Every other output pointer in the API is checked.
   - Test evidence: "Synchronization group : Repeated waits" ([TSG] L69-L70) only passes a valid pointer.
   - Status: open
@@ -152,6 +272,7 @@ across the C entry points.
   - Test evidence: "Video Flow : Invalid flow (discrete)" ([TF] L289) asserts `MXL_ERR_FLOW_INVALID` from
     `mxlFlowReaderGetGrain`. The sync-group timeout test ([TSG] L103-L107) only asserts
     `!= MXL_STATUS_OK`, so no test fixes a timeout code. Stays DOC.
+  - Related: BUG-1, BUG-2 (the fixes for these change which codes the sync group returns).
   - Status: open
 
 - [ ] **DOC-5: `mxlFlowWriterCommitGrain` partial commits aren't documented.**
@@ -344,11 +465,11 @@ across the C entry points.
   - Status: open
 
 - [ ] **DC-BUG-7: The grain path lets `headIndex` move backwards; the sample path doesn't.** (A1)
-  - This is the same issue as BUG-1, seen by comparing the two paths.
+  - This is the same issue as BUG-3, seen by comparing the two paths.
   - `openSamples` rejects `index <= _lastCommittedIndex` and any overlap with committed data ([CW] L90-L96).
     The grain path has no equivalent check against the current `headIndex`.
-  - Test evidence: see BUG-1.
-  - Fix together with BUG-1.
+  - Test evidence: see BUG-3.
+  - Fix together with BUG-3.
   - Status: open
 
 - [ ] **DC-BUG-8: `mxlIsFlowActive` reports any open failure as "flow not found".** (B6)
