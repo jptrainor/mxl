@@ -198,20 +198,49 @@ across the C entry points.
   - **Test evidence:** "Video Flow : Slices" ([TF] L612-L618) asserts `headIndex == index` after each partial
     commit, so moving the head on a partial commit is intended. No test covers cancelling and then committing
     a lower index, and nothing suggests the head is meant to move backwards. Stays BUG.
-  - **Failure scenario:**
-    1. The writer completes grain N. `_lastCommittedIndex` and `headIndex` are both N.
+  - **Root cause:**
+    - Two different indexes track the writer's progress:
+      - `headIndex` (shared memory) moves on every commit, including partial and invalid-flagged ones
+        ([DW] L167).
+      - `_lastCommittedIndex` (writer only) moves only when a grain is complete ([DW] L173-L178).
+    - `mxlFlowWriterOpenGrain` checks a new index only against `_lastCommittedIndex` ([DW] L93-L96).
+    - After a partial or invalid commit to grain N+5, `headIndex` is N+5 but `_lastCommittedIndex` is still
+      N. The writer will then accept any index from N+1 upwards, including indexes below the current head.
+  - **Failure scenario:** each sequence starts the same way:
+    1. The writer completes grain N. `headIndex` and `_lastCommittedIndex` are both N.
     2. The writer opens grain N+5 and commits some slices. `headIndex` becomes N+5, and readers can see the
        partial grain.
-    3. The writer cancels N+5. `_lastCommittedIndex` is still N.
-    4. The writer opens grain N+2. This is allowed because N+2 > N. Grain N+1 is marked invalid as a skipped
-       grain.
-    5. The writer completes N+2. `headIndex` is set to N+2, which is lower than N+5.
-    - A reader that has seen `headIndex == N+5` now sees it move back to N+2. Indexes it was told about are
-      now ahead of the head, and grain N+5's slot still holds the partial data from step 2.
-  - **Suggested regression test:** run the scenario above with a reader that records `headIndex` after each
-    commit. Assert that `headIndex` never decreases: either opening N+2 in step 4 is rejected, or `headIndex`
-    stays at N+5 or higher after step 5.
-  - Related: DC-BUG-7 (the sample path already guards against this).
+    - Any of the following then moves `headIndex` back below N+5:
+    - **(a) Cancel:**
+      - The writer calls `mxlFlowWriterCancelGrain(writer)`. This only makes the writer forget the open grain
+        ([DW] L131-L135). It doesn't flag the grain as invalid or change shared memory.
+      - It then opens and completes N+2. Opening N+2 is allowed because N+2 > N. N+1 is marked invalid as a
+        skipped grain.
+      - The commit sets `headIndex` to N+2.
+    - **(b) Invalid-flagged commit:**
+      - Instead of cancelling, the writer commits N+5 with `MXL_GRAIN_FLAG_INVALID`. Because of BUG-5, the
+        grain isn't treated as finished, so `_lastCommittedIndex` is still N.
+      - It then opens and completes N+2, which sets `headIndex` to N+2.
+      - Once #728 (the fix for BUG-5) is merged, `_lastCommittedIndex` becomes N+5 and opening N+2 is
+        rejected, so this sequence no longer triggers the bug.
+    - **(c) Opening a lower index directly:**
+      - Without cancelling or committing again, the writer opens N+2. That silently replaces the open grain
+        (INT-1).
+      - It then completes N+2, which sets `headIndex` to N+2.
+      - This sequence still triggers the bug after #728.
+    - **Result in every case:**
+      - A reader that has seen `headIndex == N+5` now sees it move back to N+2.
+      - Indexes the reader was told about are now ahead of the head.
+      - Grain N+5's slot still holds the partial data from step 2.
+  - **Suggested regression test:**
+    - Run sequences (a), (b) and (c) as separate test sections, each with a reader that records `headIndex`
+      after every commit.
+    - In each section, assert that `headIndex` never decreases: either opening N+2 is rejected, or
+      `headIndex` stays at N+5 or higher after N+2 is committed.
+    - After #728, section (b) passes through the rejected open. Sections (a) and (c) still fail until BUG-3
+      itself is fixed.
+  - Related: DC-BUG-7 (the sample path already guards against this), BUG-5 (sequence b), INT-1
+    (sequence c), INT-2 (what cancel does).
   - Status: open
 
 - [ ] **BUG-4: `mxlFlowWriterCommitGrain` copies the caller's whole `mxlGrainInfo` without checking it.** _(was BUG-2)_
